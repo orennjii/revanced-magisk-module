@@ -1,174 +1,343 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-shopt -s nullglob
 
-source utils.sh
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="$ROOT_DIR/build"
+TEMP_DIR="$ROOT_DIR/.tmp"
 
-trap "abort" INT
+PATCHES_REPO="MorpheApp/morphe-patches"
+CLI_REPO="MorpheApp/morphe-cli"
 
-if [ "${1-}" = "clean" ]; then
-	rm -r "$TEMP_DIR" "$BUILD_DIR" build.md
-	exit 0
-fi
+ARCH="arm64-v8a"
 
-jq --version >/dev/null || abort "\`jq\` is not installed. install it with 'apt install jq' or equivalent"
-java --version >/dev/null || abort "\`java\` is not installed. install it with 'apt install openjdk-21-jre' or equivalent"
-zip --version >/dev/null || abort "\`zip\` is not installed. install it with 'apt install zip' or equivalent"
+mkdir -p "$BUILD_DIR" "$TEMP_DIR"
 
-set_prebuilts
+log() {
+    printf '\033[1;36m[INFO]\033[0m %s\n' "$*"
+}
 
-vtf() { if ! isoneof "${1}" "true" "false"; then abort "ERROR: '${1}' is not a valid option for '${2}': only true or false is allowed"; fi; }
+warn() {
+    printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2
+}
 
-# -- Main config --
-toml_prep "${1:-config.toml}" || abort "could not find config file '${1:-config.toml}'\n\tUsage: $0 <config.toml>"
-main_config_t=$(toml_get_table_main)
-COMPRESSION_LEVEL=$(toml_get "$main_config_t" compression-level) || COMPRESSION_LEVEL="9"
-if ! PARALLEL_JOBS=$(toml_get "$main_config_t" parallel-jobs); then
-	if [ "$OS" = Android ]; then PARALLEL_JOBS=1; else PARALLEL_JOBS=$(nproc); fi
-fi
-PARALLEL_JOBS=1 # TODO: multiple jobs were broken by recent cli versions. and i cant bother to fix it so instead, i disable it.
-REMOVE_RV_INTEGRATIONS_CHECKS=$(toml_get "$main_config_t" remove-rv-integrations-checks) || REMOVE_RV_INTEGRATIONS_CHECKS="true"
-DEF_PATCHES_VER=$(toml_get "$main_config_t" patches-version) || DEF_PATCHES_VER="latest"
-DEF_CLI_VER=$(toml_get "$main_config_t" cli-version) || DEF_CLI_VER="latest"
-DEF_PATCHES_SRC=$(toml_get "$main_config_t" patches-source) || DEF_PATCHES_SRC="ReVanced/revanced-patches"
-DEF_CLI_SRC=$(toml_get "$main_config_t" cli-source) || DEF_CLI_SRC="ReVanced/revanced-cli"
-DEF_RV_BRAND=$(toml_get "$main_config_t" rv-brand) || DEF_RV_BRAND="ReVanced"
-mkdir -p "$TEMP_DIR" "$BUILD_DIR"
+error() {
+    printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2
+    exit 1
+}
 
-if [ "${2-}" = "--config-update" ]; then
-	config_update
-	exit 0
-fi
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || error "Missing required command: $1"
+}
 
-: >build.md
-ENABLE_MODULE_UPDATE=$(toml_get "$main_config_t" enable-module-update) || ENABLE_MODULE_UPDATE=true
-if [ "$ENABLE_MODULE_UPDATE" = true ] && [ -z "${GITHUB_REPOSITORY-}" ]; then
-	pr "You are building locally. Module updates will not be enabled."
-	ENABLE_MODULE_UPDATE=false
-fi
-if ((COMPRESSION_LEVEL > 9)) || ((COMPRESSION_LEVEL < 0)); then abort "compression-level must be within 0-9"; fi
+require_command java
+require_command curl
+require_command jq
+require_command unzip
+require_command zip
 
-rm -rf module/bin/*/tmp.*
-for file in "$TEMP_DIR"/*/changelog.md; do
-	[ -f "$file" ] && : >"$file"
-done
+# ------------------------------------------------------------
+# Versions
+# ------------------------------------------------------------
 
-mkdir -p ${MODULE_TEMPLATE_DIR}/bin/arm64 ${MODULE_TEMPLATE_DIR}/bin/arm ${MODULE_TEMPLATE_DIR}/bin/x86 ${MODULE_TEMPLATE_DIR}/bin/x64
-gh_dl "${MODULE_TEMPLATE_DIR}/bin/arm64/cmpr" "https://github.com/j-hc/cmpr/releases/latest/download/cmpr-arm64-v8a"
-gh_dl "${MODULE_TEMPLATE_DIR}/bin/arm/cmpr" "https://github.com/j-hc/cmpr/releases/latest/download/cmpr-armeabi-v7a"
-gh_dl "${MODULE_TEMPLATE_DIR}/bin/x86/cmpr" "https://github.com/j-hc/cmpr/releases/latest/download/cmpr-x86"
-gh_dl "${MODULE_TEMPLATE_DIR}/bin/x64/cmpr" "https://github.com/j-hc/cmpr/releases/latest/download/cmpr-x86_64"
+get_latest_release_asset() {
+    local repo="$1"
+    local pattern="$2"
 
-idx=0
-for table_name in $(toml_get_table_names); do
-	if [ -z "$table_name" ]; then continue; fi
-	t=$(toml_get_table "$table_name")
-	enabled=$(toml_get "$t" enabled) || enabled=true
-	vtf "$enabled" "enabled"
-	if [ "$enabled" = false ]; then continue; fi
-	if ((idx >= PARALLEL_JOBS)); then
-		wait -n
-		idx=$((idx - 1))
-	fi
+    curl -fsSL \
+        "https://api.github.com/repos/${repo}/releases/latest" |
+        jq -r --arg pattern "$pattern" '
+            .assets[]
+            | select(.name | test($pattern))
+            | .browser_download_url
+        ' |
+        head -n1
+}
 
-	declare -A app_args=()
-	patches_src=$(toml_get "$t" patches-source) || patches_src=$DEF_PATCHES_SRC
-	patches_ver=$(toml_get "$t" patches-version) || patches_ver=$DEF_PATCHES_VER
-	cli_src=$(toml_get "$t" cli-source) || cli_src=$DEF_CLI_SRC
-	cli_ver=$(toml_get "$t" cli-version) || cli_ver=$DEF_CLI_VER
+download_tools() {
+    log "Fetching latest Morphe CLI..."
 
-	if ! PREBUILTS="$(get_prebuilts "$cli_src" "$cli_ver" "$patches_src" "$patches_ver")"; then
-		epr "Could not get prebuilts"
-		continue
-	fi
-	read -r patches_jar cli_jar <<<"$PREBUILTS"
-	app_args[cli]=$cli_jar
-	app_args[ptjar]=$patches_jar
-	app_args[rv_brand]=$(toml_get "$t" rv-brand) || app_args[rv_brand]=$DEF_RV_BRAND
-	app_args[enable_update_checks]=$(toml_get "$t" enable-update-checks) && vtf "${app_args[enable_update_checks]}" "enable-update-checks" || app_args[enable_update_checks]="false"
+    local cli_url
+    cli_url="$(
+        get_latest_release_asset \
+            "$CLI_REPO" \
+            'morphe-desktop.*\.jar$'
+    )"
 
-	app_args[excluded_patches]=$(toml_get "$t" excluded-patches) || app_args[excluded_patches]=""
-	if [ -n "${app_args[excluded_patches]}" ] && [[ ${app_args[excluded_patches]} != *'"'* ]]; then abort "patch names inside excluded-patches must be quoted"; fi
-	app_args[included_patches]=$(toml_get "$t" included-patches) || app_args[included_patches]=""
-	if [ -n "${app_args[included_patches]}" ] && [[ ${app_args[included_patches]} != *'"'* ]]; then abort "patch names inside included-patches must be quoted"; fi
-	app_args[exclusive_patches]=$(toml_get "$t" exclusive-patches) && vtf "${app_args[exclusive_patches]}" "exclusive-patches" || app_args[exclusive_patches]=false
-	app_args[version]=$(toml_get "$t" version) || app_args[version]="auto"
-	app_args[app_name]=$(toml_get "$t" app-name) || app_args[app_name]=$table_name
-	app_args[patcher_args]=$(toml_get "$t" patcher-args) || app_args[patcher_args]=""
-	app_args[table]=$table_name
-	app_args[build_mode]=$(toml_get "$t" build-mode) && {
-		if ! isoneof "${app_args[build_mode]}" both apk module; then
-			abort "ERROR: build-mode '${app_args[build_mode]}' is not a valid option for '${table_name}': only 'both', 'apk' or 'module' is allowed"
-		fi
-	} || app_args[build_mode]=apk
-	app_args[include_stock]=$(toml_get "$t" include-stock) && {
-		if ! isoneof "${app_args[include_stock]}" disable merged split; then
-			abort "ERROR: include-stock '${app_args[include_stock]}' is not a valid option for '${table_name}': only 'disable', 'merged' or 'split' is allowed"
-		fi
-	} || app_args[include_stock]=merged
+    [ -n "$cli_url" ] || error "Unable to find Morphe CLI release"
 
-	for dl_from in "${DL_SRCS[@]}"; do
-		if app_args[${dl_from}_dlurl]=$(toml_get "$t" "${dl_from}-dlurl"); then
-			app_args[${dl_from}_dlurl]=${app_args[${dl_from}_dlurl]%/}
-			app_args[${dl_from}_dlurl]=${app_args[${dl_from}_dlurl]%download}
-			app_args[${dl_from}_dlurl]=${app_args[${dl_from}_dlurl]%/}
-			app_args[dl_from]=${dl_from}
-		else
-			app_args[${dl_from}_dlurl]=""
-		fi
-	done
-	if [ -z "${app_args[dl_from]-}" ]; then abort "ERROR: no 'dlurl' option was set for '$table_name'. (${DL_SRCS[*]})"; fi
-	app_args[arch]=$(toml_get "$t" arch) || app_args[arch]="all"
-	if ! isoneof "${app_args[arch]}" "both" "all" "arm64-v8a" "arm-v7a" "x86_64" "x86"; then
-		abort "wrong arch '${app_args[arch]}' for '$table_name'"
-	fi
+    curl -fL \
+        "$cli_url" \
+        -o "$TEMP_DIR/morphe.jar"
 
-	app_args[pkg_name]=$(toml_get "$t" pkg-name) || app_args[pkg_name]=""
-	app_args[dpi]=$(toml_get "$t" dpi) || app_args[dpi]=""
-	table_name_f=${table_name,,}
-	table_name_f=${table_name_f// /-}
-	app_args[module_prop_name]=$(toml_get "$t" module-prop-name) || app_args[module_prop_name]="${table_name_f}-jhc"
+    [ -s "$TEMP_DIR/morphe.jar" ] ||
+        error "Morphe CLI download failed"
 
-	if [ "${app_args[arch]}" = both ]; then
-		app_args[table]="$table_name (arm64-v8a)"
-		app_args[arch]="arm64-v8a"
-		module_prop_name_b=${app_args[module_prop_name]}
-		app_args[module_prop_name]="${module_prop_name_b}-arm64"
-		idx=$((idx + 1))
-		build_rv "$(declare -p app_args)" &
-		app_args[table]="$table_name (arm-v7a)"
-		app_args[arch]="arm-v7a"
-		app_args[module_prop_name]="${module_prop_name_b}-arm"
-		if ((idx >= PARALLEL_JOBS)); then
-			wait -n
-			idx=$((idx - 1))
-		fi
-		idx=$((idx + 1))
-		build_rv "$(declare -p app_args)" &
-	else
-		if [ "${app_args[arch]}" = "arm64-v8a" ]; then
-			app_args[module_prop_name]="${app_args[module_prop_name]}-arm64"
-		elif [ "${app_args[arch]}" = "arm-v7a" ]; then
-			app_args[module_prop_name]="${app_args[module_prop_name]}-arm"
-		fi
-		idx=$((idx + 1))
-		build_rv "$(declare -p app_args)" &
-	fi
-done
-wait
-_clean_tmp
-if [ -z "$(ls -A1 "${BUILD_DIR}")" ]; then abort "All builds failed."; fi
+    log "Morphe CLI downloaded."
+}
 
-log "\nInstall [Microg](https://github.com/MorpheApp/MicroG-RE/) for non-root YouTube and YT Music APKs"
-log "Use [zygisk-detach](https://github.com/j-hc/zygisk-detach) to detach YouTube and YT Music modules from Play Store"
-log "\n[revanced-magisk-module](https://github.com/j-hc/revanced-magisk-module)\n"
-log "$(cat "$TEMP_DIR"/*/changelog.md)"
+download_patches() {
+    log "Fetching latest Morphe patches..."
 
-SKIPPED=$(cat "$TEMP_DIR"/skipped 2>/dev/null || :)
-if [ -n "$SKIPPED" ]; then
-	log "\nSkipped:"
-	log "$SKIPPED"
-fi
+    local patch_url
+    patch_url="$(
+        get_latest_release_asset \
+            "$PATCHES_REPO" \
+            'patches-.*\.mpp$'
+    )"
 
-pr "Done"
+    [ -n "$patch_url" ] ||
+        error "Unable to find Morphe patches release"
+
+    curl -fL \
+        "$patch_url" \
+        -o "$TEMP_DIR/patches.mpp"
+
+    [ -s "$TEMP_DIR/patches.mpp" ] ||
+        error "Morphe patches download failed"
+
+    log "Morphe patches downloaded."
+}
+
+# ------------------------------------------------------------
+# Morphe helpers
+# ------------------------------------------------------------
+
+list_patches() {
+    java -jar "$TEMP_DIR/morphe.jar" \
+        list-patches \
+        -p "$TEMP_DIR/patches.mpp" \
+        --filter-package-name "$1" \
+        --with-versions \
+        --with-packages
+}
+
+get_supported_version() {
+    local package="$1"
+
+    log "Finding latest compatible version for $package..."
+
+    java -jar "$TEMP_DIR/morphe.jar" \
+        list-versions \
+        --patches "$TEMP_DIR/patches.mpp" \
+        -f "$package" |
+        sed -n '/Most common compatible versions:/,$p' |
+        awk 'NR > 1 {print $1}' |
+        head -n1
+}
+
+get_gmscore_patch_name() {
+    local package="$1"
+
+    list_patches "$package" |
+        sed -n 's/^Name: //p' |
+        grep -iE '^(GmsCore support|microG|.*GmsCore.*)$' |
+        head -n1
+}
+
+# ------------------------------------------------------------
+# APK download
+# ------------------------------------------------------------
+
+download_stock_apk() {
+    local package="$1"
+    local version="$2"
+    local output="$3"
+    local archive_url="$4"
+
+    log "Downloading $package $version..."
+
+    # The archive used by the original project contains APKs
+    # indexed by package name. Prefer it because it is stable
+    # and avoids depending on APKMirror HTML structure.
+    local archive_file="$TEMP_DIR/${package}-${version}.apk"
+
+    if curl -fsSL \
+        "${archive_url}/${version}.apk" \
+        -o "$archive_file"; then
+
+        mv "$archive_file" "$output"
+        return 0
+    fi
+
+    rm -f "$archive_file"
+
+    error \
+        "Could not download $package $version from archive."
+}
+
+# ------------------------------------------------------------
+# APK architecture
+# ------------------------------------------------------------
+
+strip_to_arm64() {
+    local apk="$1"
+
+    log "Keeping arm64-v8a native libraries only..."
+
+    zip -d "$apk" \
+        'lib/armeabi-v7a/*' \
+        'lib/x86/*' \
+        'lib/x86_64/*' \
+        >/dev/null 2>&1 || true
+}
+
+# ------------------------------------------------------------
+# Patch
+# ------------------------------------------------------------
+
+patch_apk() {
+    local package="$1"
+    local input="$2"
+    local output="$3"
+
+    local gmscore_patch
+
+    gmscore_patch="$(get_gmscore_patch_name "$package" || true)"
+
+    [ -n "$gmscore_patch" ] ||
+        error "Could not identify GmsCore patch."
+
+    log "GmsCore patch: $gmscore_patch"
+    log "Explicitly disabling GmsCore support."
+
+    local args=(
+        patch
+        -p "$TEMP_DIR/patches.mpp"
+        "$input"
+        -o "$output"
+
+        # Root-only build.
+        -d "$gmscore_patch"
+
+        # Only arm64-v8a native libraries.
+        --striplibs "$ARCH"
+
+        # Reproducible build.
+        --keystore "$TEMP_DIR/morphe.keystore"
+        --keystore-password 123456789
+        --keystore-entry-alias morphe
+        --keystore-entry-password 123456789
+        --signer morphe
+    )
+
+    java -jar "$TEMP_DIR/morphe.jar" "${args[@]}"
+}
+
+# ------------------------------------------------------------
+# Validation
+# ------------------------------------------------------------
+
+validate_apk() {
+    local apk="$1"
+    local expected_package="$2"
+
+    log "Validating $apk..."
+
+    local actual_package
+
+    actual_package="$(
+        unzip -p "$apk" AndroidManifest.xml >/dev/null 2>&1 || true
+    )
+
+    # Basic APK integrity check.
+    unzip -t "$apk" >/dev/null
+
+    # Verify no unwanted native architectures remain.
+    if unzip -l "$apk" |
+        grep -Eq 'lib/(armeabi-v7a|x86/|x86_64/)'; then
+
+        error "Non-arm64 native libraries remain in $apk"
+    fi
+
+    log "APK integrity check passed."
+}
+
+# ------------------------------------------------------------
+# Build one app
+# ------------------------------------------------------------
+
+build_app() {
+    local name="$1"
+    local package="$2"
+    local archive_url="$3"
+
+    log ""
+    log "========================================"
+    log "Building $name"
+    log "Package: $package"
+    log "Architecture: $ARCH"
+    log "========================================"
+
+    local version
+    version="$(get_supported_version "$package")"
+
+    [ -n "$version" ] ||
+        error "No compatible version found for $package"
+
+    log "Selected version: $version"
+
+    local stock="$TEMP_DIR/${name}-${version}-stock.apk"
+    local output="$BUILD_DIR/${name}-Morphe-${version}-${ARCH}.apk"
+
+    download_stock_apk \
+        "$package" \
+        "$version" \
+        "$stock" \
+        "$archive_url"
+
+    strip_to_arm64 "$stock"
+
+    patch_apk \
+        "$package" \
+        "$stock" \
+        "$output"
+
+    validate_apk \
+        "$output" \
+        "$package"
+
+    rm -f "$stock"
+
+    log "Built:"
+    log "  $output"
+}
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+
+rm -rf "$BUILD_DIR" "$TEMP_DIR"
+mkdir -p "$BUILD_DIR" "$TEMP_DIR"
+
+download_tools
+download_patches
+
+# Generate a deterministic signing key.
+keytool -genkeypair \
+    -keystore "$TEMP_DIR/morphe.keystore" \
+    -storepass 123456789 \
+    -keypass 123456789 \
+    -alias morphe \
+    -keyalg RSA \
+    -keysize 2048 \
+    -validity 10000 \
+    -dname "CN=Morphe" \
+    >/dev/null 2>&1
+
+build_app \
+    "YouTube" \
+    "com.google.android.youtube" \
+    "https://archive.org/download/jhc-apks/apks/com.google.android.youtube"
+
+build_app \
+    "Music" \
+    "com.google.android.apps.youtube.music" \
+    "https://archive.org/download/jhc-apks/apks/com.google.android.apps.youtube.music"
+
+log ""
+log "========================================"
+log "BUILD COMPLETE"
+log "========================================"
+
+ls -lh "$BUILD_DIR"
