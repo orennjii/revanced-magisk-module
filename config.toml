@@ -1,35 +1,22 @@
-enable-module-update = false
-parallel-jobs = 1
+[build]
+patches-source = "MorpheApp/morphe-patches"
+cli-source = "MorpheApp/morphe-cli"
 
-[YouTube-Morphe]
+patches-version = "latest"
+cli-version = "latest"
+
+arch = "arm64-v8a"
+
+[YouTube]
+package = "com.google.android.youtube"
 app-name = "YouTube"
 
-patches-source = "MorpheApp/morphe-patches"
-cli-source = "MorpheApp/morphe-cli"
-rv-brand = "Morphe"
+apkmirror-url = "https://www.apkmirror.com/apk/google-inc/youtube"
+archive-url = "https://archive.org/download/jhc-apks/apks/com.google.android.youtube"
 
-build-mode = "apk"
-arch = "arm64-v8a"
-version = "auto"
-
-apkmirror-dlurl = "https://www.apkmirror.com/apk/google-inc/youtube"
-archive-dlurl = "https://archive.org/download/jhc-apks/apks/com.google.android.youtube"
-
-enable-update-checks = false
-
-
-[Music-Morphe]
+[YouTube-Music]
+package = "com.google.android.apps.youtube.music"
 app-name = "Music"
 
-patches-source = "MorpheApp/morphe-patches"
-cli-source = "MorpheApp/morphe-cli"
-rv-brand = "Morphe"
-
-build-mode = "apk"
-arch = "arm64-v8a"
-version = "auto"
-
-apkmirror-dlurl = "https://www.apkmirror.com/apk/google-inc/youtube-music"
-archive-dlurl = "https://archive.org/download/jhc-apks/apks/com.google.android.apps.youtube.music"
-
-enable-update-checks = false
+apkmirror-url = "https://www.apkmirror.com/apk/google-inc/youtube-music"
+archive-url = "https://archive.org/download/jhc-apks/apks/com.google.android.apps.youtube.music"
