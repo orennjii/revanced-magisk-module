@@ -765,7 +765,8 @@ build_rv() {
 
 		if [ "$build_mode" = "apk" ]; then
 			if [ -n "$microg_patch" ]; then
-				patcher_args+=("-e \"${microg_patch}\"")
+				# Root-only APK: do not enable GmsCore support.
+        		:
 			fi
 		elif [ "$build_mode" = "module" ]; then
 			if [ -n "$microg_patch" ]; then
