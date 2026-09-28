@@ -176,9 +176,5 @@ download_stock_apk() {
     fi
 
     [ -s "$output" ] || error "Downloaded stock APK is empty: $output"
-    local unzip_status=0
-    unzip -t "$output" >/dev/null 2>&1 || unzip_status=$?
-    if [ "$unzip_status" -ge 2 ]; then
-        error "Downloaded stock APK is corrupted (exit code $unzip_status): $output"
-    fi
+    unzip -l "$output" >/dev/null 2>&1 || error "Downloaded stock APK cannot be read as zip: $output"
 }

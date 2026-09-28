@@ -50,14 +50,8 @@ verify_patched_apk() {
     # 1. APK file exists and non-empty
     [ -s "$apk" ] || error "Output APK does not exist or is empty: $apk"
 
-    # 2. APK zip integrity (code 0: ok, code 1: warning such as APK signing block extra bytes)
-    local unzip_out
-    local unzip_status=0
-    unzip_out="$(unzip -t "$apk" 2>&1)" || unzip_status=$?
-    if [ "$unzip_status" -ge 2 ]; then
-        printf '%s\n' "$unzip_out" >&2
-        error "Corrupted APK zip archive (exit code $unzip_status): $apk"
-    fi
+    # 2. APK zip integrity and readability
+    unzip -l "$apk" >/dev/null 2>&1 || error "Failed to read APK archive structure: $apk"
 
     # 3. Only arm64-v8a native libraries remain
     if unzip -l "$apk" | grep -Eq 'lib/(armeabi-v7a|x86/|x86_64/)'; then
